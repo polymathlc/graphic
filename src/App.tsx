@@ -50,6 +50,12 @@ import {
 } from "lucide-react";
 import { importFile } from "./lib/importer";
 import {
+  protectProportions,
+  resizeKind,
+  resizeProps,
+  straightenText,
+} from "./lib/proportions";
+import {
   downloadProject,
   loadDraft,
   readProject,
@@ -276,6 +282,11 @@ export default function App() {
         await c.loadFromJSON(
           p.pages.find((page) => page.id === p.activePageId)!.json,
         );
+        // Drafts saved before proportional text fitting may contain stretched text.
+        for (const object of c.getObjects()) {
+          straightenText(object);
+          protectProportions(object);
+        }
         projectRef.current = p;
         setProject(p);
         fit();
@@ -307,8 +318,11 @@ export default function App() {
       preserveObjectStacking: true,
       selectionColor: "#6555df20",
       selectionBorderColor: "#6555df",
+      // Holding Shift must not unlock one-directional stretching of text or images.
+      uniScaleKey: null,
     });
     canvasRef.current = c;
+    c.on("object:added", ({ target }) => protectProportions(target));
     const onChange = () => commit();
     c.on("object:modified", onChange);
     c.on("text:changed", onChange);
@@ -1182,14 +1196,25 @@ export default function App() {
                   {numberField(
                     "Width",
                     selected.width * selected.scaleX,
-                    (n) => update({ scaleX: n / Math.max(1, selected.width) }),
+                    (n) =>
+                      update(
+                        resizeProps(resizeKind(selected), selected, "width", n),
+                      ),
                     1,
                     10000,
                   )}
                   {numberField(
                     "Height",
                     selected.height * selected.scaleY,
-                    (n) => update({ scaleY: n / Math.max(1, selected.height) }),
+                    (n) =>
+                      update(
+                        resizeProps(
+                          resizeKind(selected),
+                          selected,
+                          "height",
+                          n,
+                        ),
+                      ),
                     1,
                     10000,
                   )}

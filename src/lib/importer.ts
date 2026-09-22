@@ -17,6 +17,13 @@ import {
   isInsideProtectedGraphic,
   isPlainTextBackground,
 } from "./graphic-protection";
+import {
+  BASELINE_OFFSET,
+  canvasMeasure,
+  fitPageText,
+  type FittedText,
+  type TextMeasure,
+} from "./text-fit";
 
 export interface ImportedPage {
   id: string;
@@ -37,7 +44,20 @@ interface TextRegion extends Region {
   fontStyle?: "normal" | "italic";
   direction?: "ltr" | "rtl";
   wordRegions?: Region[];
+  /** Runs sharing a line index are given one font size. */
+  line?: number;
+  /** Start of the text on its baseline, in page pixels. */
+  baselineX?: number;
+  baselineY?: number;
+  /** The font size came from the document itself and must not be re-estimated. */
+  exactSize?: boolean;
 }
+
+/**
+ * Advance widths include side bearings that scanned ink boxes do not, roughly
+ * this fraction of an em in total for Arial-like faces.
+ */
+const SIDE_BEARING = 0.08;
 
 export interface ImportOptions {
   ocrLanguage?: string;
@@ -146,29 +166,85 @@ function textBounds(text: TextRegion, padding = 2): Region {
   };
 }
 
-function makeText(text: TextRegion, fill: string): Textbox {
-  const measure = contextOf(canvasOf(1, 1));
-  measure.font = `${text.fontStyle ?? "normal"} ${text.fontWeight ?? "normal"} ${text.fontSize}px ${text.fontFamily}`;
-  const naturalWidth = Math.max(1, measure.measureText(text.text).width + 2);
+function textTarget(text: TextRegion): number {
+  // PDF widths are advance widths already; OCR boxes only cover the ink.
+  return text.exactSize
+    ? text.width
+    : text.width + text.fontSize * SIDE_BEARING;
+}
+
+/** Fit all runs of a page together so sizes agree within lines and across the page. */
+function fitTexts(texts: TextRegion[]): FittedText[] {
+  const context = contextOf(canvasOf(1, 1));
+  const measures = new Map<string, TextMeasure>();
+  const measureFor = (text: TextRegion) => {
+    const key = `${text.fontStyle ?? "normal"} ${text.fontFamily}`;
+    let measure = measures.get(key);
+    if (!measure) {
+      measure = canvasMeasure(context, text.fontFamily, text.fontStyle);
+      measures.set(key, measure);
+    }
+    return measure;
+  };
+  return fitPageText(
+    (run) => measureFor(run.source),
+    texts.map((text, index) => ({
+      source: text,
+      text: text.text,
+      targetWidth: textTarget(text),
+      heightSize: text.fontSize,
+      fontWeight: text.fontWeight,
+      exactSize: text.exactSize,
+      // Runs without a known line never share a size with anything else.
+      line: text.line ?? -1 - index,
+    })),
+  );
+}
+
+/**
+ * Build an editable text box that keeps the font's true proportions. The box
+ * is never scaled: size, weight and letter spacing reproduce the original
+ * width, and the first baseline sits on the scanned baseline.
+ */
+function makeText(text: TextRegion, fit: FittedText, fill: string): Textbox {
+  const angle = (text.angle * Math.PI) / 180;
+  const cos = Math.cos(angle),
+    sin = Math.sin(angle);
+  const bearing = text.exactSize ? 0 : (text.fontSize * SIDE_BEARING) / 2;
+  const anchorX = text.baselineX ?? text.x - bearing * cos;
+  const anchorY =
+    text.baselineY ?? text.y + fit.fontSize * 0.72 - bearing * sin;
+  const drop = BASELINE_OFFSET * fit.fontSize;
+  // Slack stops Fabric's own glyph-by-glyph measurement from wrapping the run.
+  const slack = Math.max(2, fit.fontSize * 0.25);
+  const rtl = text.direction === "rtl";
   const object = new Textbox(text.text, {
-    left: text.x,
-    top: text.y - text.fontSize * 0.12,
+    left: anchorX + drop * sin - (rtl ? slack * cos : 0),
+    top: anchorY - drop * cos - (rtl ? slack * sin : 0),
     originX: "left",
     originY: "top",
-    width: naturalWidth,
-    fontSize: text.fontSize,
+    width: Math.max(1, fit.width + slack),
+    fontSize: fit.fontSize,
     fontFamily: text.fontFamily,
-    fontWeight: text.fontWeight ?? "normal",
+    fontWeight: fit.fontWeight,
     fontStyle: text.fontStyle ?? "normal",
     direction: text.direction ?? "ltr",
-    textAlign: text.direction === "rtl" ? "right" : "left",
+    textAlign: rtl ? "right" : "left",
+    charSpacing: fit.charSpacing,
     fill,
     angle: text.angle,
+    scaleX: 1,
+    scaleY: 1,
     lineHeight: 1,
     padding: 3,
     splitByGrapheme: false,
   });
-  object.set({ scaleX: text.width / Math.max(1, object.width) });
+  // A substituted font can still measure a little wider inside Fabric; widen
+  // the box rather than letting one recognized line break into two.
+  for (let attempt = 0; attempt < 4 && object.textLines.length > 1; attempt++) {
+    object.set({ width: object.width * 1.08 + slack });
+    object.initDimensions();
+  }
   return named(
     object,
     text.text.length > 42 ? `${text.text.slice(0, 39)}…` : text.text,
@@ -190,6 +266,7 @@ async function assemblePage(
   const context = contextOf(cleaned);
   context.drawImage(source, 0, 0);
   const textObjects: Textbox[] = [];
+  const convertible: Array<{ text: TextRegion; fill: string }> = [];
   for (const text of texts) {
     const bounds = clampRegion(textBounds(text), width, height);
     if (!bounds.width || !bounds.height) continue;
@@ -224,8 +301,12 @@ async function assemblePage(
       context.fillRect(-2, -2, text.width + 4, text.height + 4);
       context.restore();
     }
-    textObjects.push(makeText(text, fill));
+    convertible.push({ text, fill });
   }
+  const fits = fitTexts(convertible.map((item) => item.text));
+  convertible.forEach(({ text, fill }, index) =>
+    textObjects.push(makeText(text, fits[index], fill)),
+  );
 
   const cleanPixels = context.getImageData(0, 0, width, height);
   const regions = mergeRegions([
@@ -411,6 +492,8 @@ class OCRSession {
           y: run.textTop,
           fontFamily: "Arial",
           angle: 0,
+          line: run.line,
+          baselineY: run.baseline,
         }));
     } catch (error) {
       this.failed = true;
@@ -460,7 +543,7 @@ async function nativePDFText(
       (item): item is TextItem => "str" in item && Boolean(item.str.trim()),
     )
     .slice(0, MAX_TEXT_BOXES)
-    .flatMap((item) => {
+    .flatMap((item, index) => {
       const style = content.styles[item.fontName];
       const matrix = pdfjs.Util.transform(transform, item.transform);
       const fontSize = Math.hypot(matrix[2], matrix[3]);
@@ -476,6 +559,10 @@ async function nativePDFText(
       return [
         {
           text: item.str,
+          line: index,
+          baselineX: matrix[4],
+          baselineY: matrix[5],
+          exactSize: true,
           x: matrix[4] + ascent * Math.sin(angle),
           y: matrix[5] - ascent * Math.cos(angle),
           width,

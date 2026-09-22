@@ -9,6 +9,9 @@ interface SavedObject {
   width: number;
   height: number;
   scaleX: number;
+  scaleY?: number;
+  fontSize?: number;
+  charSpacing?: number;
   angle: number;
   selectable?: boolean;
   src?: string;
@@ -158,13 +161,11 @@ test.beforeEach(async ({ page }) => {
 test("real image OCR creates editable text and independent graphic crops", async ({
   page,
 }) => {
-  await page
-    .getByLabel("Import images or PDFs")
-    .setInputFiles({
-      name: "poster.png",
-      mimeType: "image/png",
-      buffer: await imageFixture(page),
-    });
+  await page.getByLabel("Import images or PDFs").setInputFiles({
+    name: "poster.png",
+    mimeType: "image/png",
+    buffer: await imageFixture(page),
+  });
   await waitForImport(page, "HELLO WORLD");
   await page
     .locator(".layer-select")
@@ -200,13 +201,11 @@ test("real image OCR creates editable text and independent graphic crops", async
 test("native multi-page PDFs keep text, dimensions, and separate pages", async ({
   page,
 }) => {
-  await page
-    .getByLabel("Import images or PDFs")
-    .setInputFiles({
-      name: "two-pages.pdf",
-      mimeType: "application/pdf",
-      buffer: nativePDF(),
-    });
+  await page.getByLabel("Import images or PDFs").setInputFiles({
+    name: "two-pages.pdf",
+    mimeType: "application/pdf",
+    buffer: nativePDF(),
+  });
   await waitForImport(page, "EDITABLE PAGE 1");
   await expect(page.locator(".page-card")).toHaveCount(2);
   const project = await savedProject(page);
@@ -266,13 +265,11 @@ test("native multi-page PDFs keep text, dimensions, and separate pages", async (
 
 test("scanned PDFs fall back to real OCR", async ({ page }) => {
   const jpeg = await imageFixture(page, "SCANNED PAGE", "image/jpeg");
-  await page
-    .getByLabel("Import images or PDFs")
-    .setInputFiles({
-      name: "scan.pdf",
-      mimeType: "application/pdf",
-      buffer: scannedPDF(jpeg),
-    });
+  await page.getByLabel("Import images or PDFs").setInputFiles({
+    name: "scan.pdf",
+    mimeType: "application/pdf",
+    buffer: scannedPDF(jpeg),
+  });
   await waitForImport(page, "SCANNED PAGE");
   const project = await savedProject(page);
   expect(
@@ -312,25 +309,82 @@ test("pasted image files go through the same conversion flow", async ({
 test("invalid and oversized-page PDFs show clear errors without changing the project", async ({
   page,
 }) => {
-  await page
-    .getByLabel("Import images or PDFs")
-    .setInputFiles({
-      name: "broken.pdf",
-      mimeType: "application/pdf",
-      buffer: Buffer.from("not a valid PDF document"),
-    });
+  await page.getByLabel("Import images or PDFs").setInputFiles({
+    name: "broken.pdf",
+    mimeType: "application/pdf",
+    buffer: Buffer.from("not a valid PDF document"),
+  });
   await expect(page.getByRole("alert")).toContainText(
     "This PDF could not be read",
   );
   await expect(page.locator(".progress-overlay")).toHaveCount(0);
-  await page
-    .getByLabel("Import images or PDFs")
-    .setInputFiles({
-      name: "too-many.pdf",
-      mimeType: "application/pdf",
-      buffer: nativePDF(21),
-    });
+  await page.getByLabel("Import images or PDFs").setInputFiles({
+    name: "too-many.pdf",
+    mimeType: "application/pdf",
+    buffer: nativePDF(21),
+  });
   await expect(page.getByRole("alert")).toContainText("20 pages or fewer");
   await expect(page.locator(".page-card")).toHaveCount(1);
   expect((await savedProject(page)).pages[0].json.objects).toHaveLength(0);
+});
+
+/** Exam-cover-like page: a heading, mixed-size lines and a bold label. */
+async function documentFixture(page: Page): Promise<Buffer> {
+  const data = await page.evaluate(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 1100;
+    canvas.height = 700;
+    const context = canvas.getContext("2d")!;
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.fillStyle = "#111111";
+    context.font = "bold 44px Arial";
+    context.fillText("WEIGHTED ASSESSMENT", 180, 110);
+    context.font = "30px Arial";
+    context.fillText("Do not turn over this page until you are told", 80, 250);
+    context.fillText("This paper consists of eighteen questions", 80, 330);
+    context.fillText("Follow all instructions carefully", 80, 410);
+    context.font = "bold 34px Arial";
+    context.fillText("Instructions to Pupils", 80, 520);
+    return canvas.toDataURL("image/png").split(",")[1];
+  });
+  return Buffer.from(data, "base64");
+}
+
+test("recognized text keeps natural letter proportions with consistent sizes", async ({
+  page,
+}) => {
+  await page.getByLabel("Import images or PDFs").setInputFiles({
+    name: "cover.png",
+    mimeType: "image/png",
+    buffer: await documentFixture(page),
+  });
+  await waitForImport(page, "carefully");
+  const project = await savedProject(page);
+  const texts = project.pages[0].json.objects.filter(
+    (object) => object.type.toLowerCase() === "textbox",
+  );
+  expect(texts.length).toBeGreaterThanOrEqual(3);
+  for (const text of texts) {
+    // No text box may be stretched or squeezed along one axis.
+    expect(text.scaleX).toBe(1);
+    expect(text.scaleY ?? 1).toBe(1);
+    expect(Math.abs(text.charSpacing ?? 0)).toBeLessThanOrEqual(160);
+  }
+  const body = texts.filter((text) =>
+    /turn|paper|instructions carefully|Follow/.test(text.text ?? ""),
+  );
+  expect(body.length).toBeGreaterThanOrEqual(2);
+  const sizes = body.map((text) => text.fontSize!);
+  // The three 30px body lines were printed at one size and must stay close to it.
+  expect(Math.max(...sizes) / Math.min(...sizes)).toBeLessThan(1.1);
+  for (const size of sizes) {
+    expect(size).toBeGreaterThan(24);
+    expect(size).toBeLessThan(37);
+  }
+  const heading = texts.find((text) =>
+    /WEIGHTED|ASSESSMENT/.test(text.text ?? ""),
+  );
+  expect(heading).toBeDefined();
+  expect(heading!.fontSize!).toBeGreaterThan(Math.max(...sizes) * 1.2);
 });

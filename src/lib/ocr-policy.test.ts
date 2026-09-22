@@ -3,6 +3,8 @@ import {
   conservativeTextRuns,
   isOrdinaryText,
   isReliableWord,
+  lineBaseline,
+  sizeFromInk,
   type OCRWord,
 } from "./ocr-policy";
 
@@ -74,5 +76,68 @@ describe("conservative OCR policy", () => {
     expect(runs).toHaveLength(1);
     expect(runs[0].text).toBe("Body");
     expect(runs[0].wordRegions).toHaveLength(1);
+  });
+});
+
+describe("baseline and size estimation", () => {
+  function placed(text: string, x: number, top: number, bottom: number) {
+    return {
+      text,
+      confidence: 97,
+      bbox: { x0: x, y0: top, x1: x + 40, y1: bottom },
+      symbols: [...text].map((text) => ({ text, confidence: 99 })),
+    };
+  }
+
+  it("uses the bottom of descender-free words as the baseline", () => {
+    const at = lineBaseline({ words: [] }, [
+      { text: "Name", region: { x: 0, y: 10, width: 40, height: 20 } },
+      { text: "page", region: { x: 50, y: 14, width: 40, height: 22 } },
+    ]);
+    expect(at(0)).toBe(30);
+  });
+
+  it("trusts Tesseract's baseline only when it agrees with the ink", () => {
+    const words = [
+      { text: "Name", region: { x: 0, y: 10, width: 40, height: 20 } },
+    ];
+    expect(
+      lineBaseline(
+        { words: [], baseline: { x0: 0, y0: 30, x1: 40, y1: 31 } },
+        words,
+      )(40),
+    ).toBeCloseTo(31);
+    expect(
+      lineBaseline(
+        { words: [], baseline: { x0: 0, y0: 90, x1: 40, y1: 90 } },
+        words,
+      )(20),
+    ).toBe(30);
+  });
+
+  it("derives the size from cap height, or x-height for short letters", () => {
+    expect(sizeFromInk(["Name"], 10, 10 + 0.716 * 20)).toBeCloseTo(20);
+    expect(sizeFromInk(["were", "on"], 10, 10 + 0.519 * 20)).toBeCloseTo(20);
+    expect(sizeFromInk(["Name"], 10, 5)).toBeNaN();
+  });
+
+  it("gives every run on one printed line the same size and baseline", () => {
+    const runs = conservativeTextRuns([
+      {
+        words: [
+          placed("Do", 0, 10, 30),
+          placed("not", 45, 12, 30),
+          placed("?!#", 95, 0, 60),
+          placed("turn", 200, 12, 30),
+          placed("page", 245, 14, 35),
+        ],
+      },
+    ]);
+    // The unreadable token splits the line into separate runs.
+    expect(runs.length).toBe(2);
+    expect(new Set(runs.map((item) => item.fontSize)).size).toBe(1);
+    expect(new Set(runs.map((item) => item.baseline)).size).toBe(1);
+    expect(new Set(runs.map((item) => item.line)).size).toBe(1);
+    expect(runs[0].baseline).toBe(30);
   });
 });

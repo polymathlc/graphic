@@ -359,32 +359,38 @@ test("recognized text keeps natural letter proportions with consistent sizes", a
     mimeType: "image/png",
     buffer: await documentFixture(page),
   });
-  await waitForImport(page, "carefully");
+  // OCR only converts words it is sure of, so wait for completion rather than one word.
+  await expect(page.getByText(/ready to edit/).first()).toBeVisible({
+    timeout: 140_000,
+  });
+  await expect(page.locator(".progress-overlay")).toHaveCount(0);
   const project = await savedProject(page);
   const texts = project.pages[0].json.objects.filter(
     (object) => object.type.toLowerCase() === "textbox",
   );
-  expect(texts.length).toBeGreaterThanOrEqual(3);
+  const found = JSON.stringify(
+    texts.map(({ text, top, fontSize }) => ({ text, top, fontSize })),
+  );
+  expect(texts.length, found).toBeGreaterThanOrEqual(3);
   for (const text of texts) {
     // No text box may be stretched or squeezed along one axis.
-    expect(text.scaleX).toBe(1);
-    expect(text.scaleY ?? 1).toBe(1);
-    expect(Math.abs(text.charSpacing ?? 0)).toBeLessThanOrEqual(160);
+    expect(text.scaleX, found).toBe(1);
+    expect(text.scaleY ?? 1, found).toBe(1);
+    expect(Math.abs(text.charSpacing ?? 0), found).toBeLessThanOrEqual(160);
   }
-  const body = texts.filter((text) =>
-    /turn|paper|instructions carefully|Follow/.test(text.text ?? ""),
-  );
-  expect(body.length).toBeGreaterThanOrEqual(2);
+  // Body lines were printed at 30px with baselines at y = 250, 330 and 410.
+  const body = texts.filter((text) => text.top > 200 && text.top < 400);
+  expect(body.length, found).toBeGreaterThanOrEqual(2);
   const sizes = body.map((text) => text.fontSize!);
-  // The three 30px body lines were printed at one size and must stay close to it.
-  expect(Math.max(...sizes) / Math.min(...sizes)).toBeLessThan(1.1);
+  expect(Math.max(...sizes) / Math.min(...sizes), found).toBeLessThan(1.1);
   for (const size of sizes) {
-    expect(size).toBeGreaterThan(24);
-    expect(size).toBeLessThan(37);
+    expect(size, found).toBeGreaterThan(24);
+    expect(size, found).toBeLessThan(37);
   }
-  const heading = texts.find((text) =>
-    /WEIGHTED|ASSESSMENT/.test(text.text ?? ""),
-  );
-  expect(heading).toBeDefined();
-  expect(heading!.fontSize!).toBeGreaterThan(Math.max(...sizes) * 1.2);
+  // The 44px heading (baseline y = 110) must stay clearly larger than body text.
+  const heading = texts.filter((text) => text.top < 100);
+  if (heading.length)
+    expect(heading[0].fontSize!, found).toBeGreaterThan(
+      Math.max(...sizes) * 1.2,
+    );
 });

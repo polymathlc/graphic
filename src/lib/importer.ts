@@ -5,11 +5,18 @@ import {
   cssColor,
   findGraphicRegions,
   inkColor,
+  mergeRegions,
   pageColor,
   type Region,
 } from "./segmentation";
 import type { Worker as OCRWorker } from "tesseract.js";
 import type { PDFPageProxy, TextItem } from "pdfjs-dist/types/src/display/api";
+import { conservativeTextRuns, isOrdinaryText } from "./ocr-policy";
+import {
+  findProtectedGraphics,
+  isInsideProtectedGraphic,
+  isPlainTextBackground,
+} from "./graphic-protection";
 
 export interface ImportedPage {
   id: string;
@@ -29,6 +36,12 @@ interface TextRegion extends Region {
   fontWeight?: "normal" | "bold";
   fontStyle?: "normal" | "italic";
   direction?: "ltr" | "rtl";
+  wordRegions?: Region[];
+}
+
+export interface ImportOptions {
+  ocrLanguage?: string;
+  textMode?: "conservative" | "image-only";
 }
 
 const MAX_EDGE = 1800;
@@ -36,7 +49,7 @@ const MAX_PAGES = 20;
 const MAX_TEXT_BOXES = 1500;
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 const RECONSTRUCTION_WARNING =
-  "Text and graphics are reconstructed approximately. Review recognized words, font sizes, and spacing. Graphics remain raster images; backgrounds beneath text are estimated from nearby colors.";
+  "Only clear text on plain backgrounds is converted. Text inside graphics and uncertain words stay in their original image. Review recognized text and font spacing; graphics remain raster images.";
 
 async function deadline<T>(
   promise: Promise<T>,
@@ -172,6 +185,7 @@ async function assemblePage(
   const width = source.width,
     height = source.height;
   const original = contextOf(source).getImageData(0, 0, width, height);
+  const protectedGraphics = findProtectedGraphics(original);
   const cleaned = canvasOf(width, height);
   const context = contextOf(cleaned);
   context.drawImage(source, 0, 0);
@@ -179,19 +193,45 @@ async function assemblePage(
   for (const text of texts) {
     const bounds = clampRegion(textBounds(text), width, height);
     if (!bounds.width || !bounds.height) continue;
+    const masks = text.wordRegions ?? [bounds];
+    if (
+      !isOrdinaryText(text.text) ||
+      masks.some(
+        (region) =>
+          isInsideProtectedGraphic(region, protectedGraphics) ||
+          !isPlainTextBackground(original, region),
+      )
+    )
+      continue;
     const background = borderColor(original, bounds);
     const fill = inkColor(original, bounds, background);
-    context.save();
-    context.translate(text.x, text.y);
-    context.rotate((text.angle * Math.PI) / 180);
-    context.fillStyle = cssColor(background);
-    context.fillRect(-2, -2, text.width + 4, text.height + 4);
-    context.restore();
+    if (text.wordRegions) {
+      // Never erase a whole OCR line: an icon or doubtful word may sit in its gaps.
+      for (const word of text.wordRegions) {
+        context.fillStyle = cssColor(borderColor(original, word));
+        context.fillRect(
+          word.x - 1,
+          word.y - 1,
+          word.width + 2,
+          word.height + 2,
+        );
+      }
+    } else {
+      context.save();
+      context.translate(text.x, text.y);
+      context.rotate((text.angle * Math.PI) / 180);
+      context.fillStyle = cssColor(background);
+      context.fillRect(-2, -2, text.width + 4, text.height + 4);
+      context.restore();
+    }
     textObjects.push(makeText(text, fill));
   }
 
   const cleanPixels = context.getImageData(0, 0, width, height);
-  const regions = findGraphicRegions(cleanPixels);
+  const regions = mergeRegions([
+    ...findGraphicRegions(cleanPixels),
+    ...protectedGraphics,
+  ]);
   const backgroundColor = pageColor(cleanPixels);
   const base = canvasOf(width, height);
   const baseContext = contextOf(base);
@@ -245,9 +285,9 @@ async function assemblePage(
     }),
     "Page background",
   );
-  if (!texts.length)
+  if (!textObjects.length)
     warnings.push(
-      "No editable text was detected. The page is available as image elements; you can add text manually.",
+      "No text was clear enough to convert safely. Original content remains in image elements; you can add text manually.",
     );
   if (texts.length >= MAX_TEXT_BOXES)
     warnings.push(
@@ -260,6 +300,32 @@ async function assemblePage(
     height,
     objects: [background, ...graphics, ...textObjects],
     warnings: [...new Set(warnings)],
+  };
+}
+
+function originalImagePage(
+  source: HTMLCanvasElement,
+  name: string,
+): ImportedPage {
+  return {
+    id: crypto.randomUUID(),
+    name,
+    width: source.width,
+    height: source.height,
+    objects: [
+      named(
+        new FabricImage(source, {
+          left: 0,
+          top: 0,
+          originX: "left",
+          originY: "top",
+          selectable: true,
+          evented: true,
+        }),
+        "Original image",
+      ),
+    ],
+    warnings: [],
   };
 }
 
@@ -326,22 +392,23 @@ class OCRSession {
       const lines = (result.data.blocks ?? []).flatMap((block) =>
         block.paragraphs.flatMap((paragraph) => paragraph.lines),
       );
-      return lines
-        .filter(
-          (line) =>
-            line.text.trim() &&
-            line.confidence >= 45 &&
-            line.bbox.x1 > line.bbox.x0 &&
-            line.bbox.y1 > line.bbox.y0,
-        )
+      const pixels = contextOf(canvas).getImageData(
+        0,
+        0,
+        canvas.width,
+        canvas.height,
+      );
+      const protectedGraphics = findProtectedGraphics(pixels);
+      return conservativeTextRuns(
+        lines,
+        (region) =>
+          !isInsideProtectedGraphic(region, protectedGraphics) &&
+          isPlainTextBackground(pixels, region),
+      )
         .slice(0, MAX_TEXT_BOXES)
-        .map((line) => ({
-          x: line.bbox.x0,
-          y: line.bbox.y0,
-          width: line.bbox.x1 - line.bbox.x0,
-          height: line.bbox.y1 - line.bbox.y0,
-          text: line.text.trim().replace(/\s+/g, " "),
-          fontSize: Math.max(6, (line.bbox.y1 - line.bbox.y0) * 1.16),
+        .map((run) => ({
+          ...run,
+          y: run.textTop,
           fontFamily: "Arial",
           angle: 0,
         }));
@@ -432,6 +499,7 @@ async function importPDF(
   file: File,
   onProgress: Progress,
   session: OCRSession,
+  textMode: ImportOptions["textMode"],
 ): Promise<ImportedPage[]> {
   onProgress("Opening PDF", 0.02);
   const [pdfjs, { default: workerSrc }] = await Promise.all([
@@ -475,6 +543,12 @@ async function importPDF(
           canvasContext: contextOf(canvas),
           viewport,
         }).promise;
+        const name = `${file.name.replace(/\.pdf$/i, "")} · ${number}`;
+        if (textMode === "image-only") {
+          pages.push(originalImagePage(canvas, name));
+          progress("Ready", 1);
+          continue;
+        }
         const warnings = [RECONSTRUCTION_WARNING];
         let texts = await nativePDFText(page, scale, viewport.transform);
         if (!texts.length)
@@ -489,14 +563,7 @@ async function importPDF(
             "Selectable PDF text was extracted. Fonts use browser substitutes; text baked into images on this page remains in the artwork.",
           );
         progress("Separating graphics and text", 0.9);
-        pages.push(
-          await assemblePage(
-            canvas,
-            texts,
-            `${file.name.replace(/\.pdf$/i, "")} · ${number}`,
-            warnings,
-          ),
-        );
+        pages.push(await assemblePage(canvas, texts, name, warnings));
         progress("Ready", 1);
       } finally {
         page.cleanup();
@@ -522,7 +589,7 @@ async function importPDF(
 export async function importFile(
   file: File,
   onProgress: Progress,
-  options: { ocrLanguage?: string } = {},
+  options: ImportOptions = {},
 ): Promise<ImportedPage[]> {
   if (!file.size)
     throw new Error("This file is empty. Choose another image or PDF.");
@@ -543,9 +610,15 @@ export async function importFile(
     throw new Error("Choose a valid recognition language.");
   const session = new OCRSession(language);
   try {
-    if (isPDF) return await importPDF(file, onProgress, session);
+    if (isPDF)
+      return await importPDF(file, onProgress, session, options.textMode);
     onProgress("Reading image", 0.02);
     const canvas = await imageCanvas(file);
+    const name = file.name.replace(/\.[^.]+$/, "") || "Pasted image";
+    if (options.textMode === "image-only") {
+      onProgress("Ready", 1);
+      return [originalImagePage(canvas, name)];
+    }
     const warnings = [RECONSTRUCTION_WARNING];
     const texts = await recognizeSafely(
       canvas,
@@ -554,12 +627,7 @@ export async function importFile(
       warnings,
     );
     onProgress("Separating graphics and text", 0.9);
-    const page = await assemblePage(
-      canvas,
-      texts,
-      file.name.replace(/\.[^.]+$/, "") || "Pasted image",
-      warnings,
-    );
+    const page = await assemblePage(canvas, texts, name, warnings);
     onProgress("Ready", 1);
     return [page];
   } finally {

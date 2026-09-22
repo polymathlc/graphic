@@ -443,6 +443,22 @@ a:hover {
 .language-field > span {
   font-size: 9px;
 }
+.conversion-hint {
+  margin: 8px 0 0;
+  color: var(--muted, #77736e);
+  font-size: 10px;
+  line-height: 1.5;
+  grid-column: 1 / -1;
+}
+.conversion-hint span {
+  display: block;
+  margin-top: 4px;
+  color: #57524b;
+}
+.language-field select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 .divider-label {
   display: flex;
   align-items: center;

@@ -153,6 +153,17 @@ export default function App() {
   const [help, setHelp] = useState(false);
   const [crop, setCrop] = useState<number[] | null>(null);
   const [language, setLanguage] = useState("eng");
+  const [textMode, setTextMode] = useState<"conservative" | "image-only">(
+    () => {
+      try {
+        return localStorage.getItem("graphic-text-mode") === "image-only"
+          ? "image-only"
+          : "conservative";
+      } catch {
+        return "conservative";
+      }
+    },
+  );
   const fileInput = useRef<HTMLInputElement>(null);
   const projectInput = useRef<HTMLInputElement>(null);
   const suppress = useRef(false);
@@ -282,6 +293,14 @@ export default function App() {
   );
 
   useEffect(() => {
+    try {
+      localStorage.setItem("graphic-text-mode", textMode);
+    } catch {
+      /* Editing also works without preference storage. */
+    }
+  }, [textMode]);
+
+  useEffect(() => {
     mounted.current = true;
     const c = new Canvas(canvasEl.current!, {
       backgroundColor: "#ffffff",
@@ -364,7 +383,7 @@ export default function App() {
             files[index],
             (message, progress) =>
               setBusy({ message, progress: (index + progress) / files.length }),
-            { ocrLanguage: language },
+            { ocrLanguage: language, textMode },
           );
           for (const page of pages) {
             imported.push({
@@ -405,7 +424,7 @@ export default function App() {
         );
       }, "Preparing your files…");
     },
-    [run, language, snapshot, showProject, commit, notice],
+    [run, language, textMode, snapshot, showProject, commit, notice],
   );
   const update = useCallback(
     (props: Record<string, unknown>) => {
@@ -957,10 +976,30 @@ export default function App() {
             </span>
           </button>
           <label className="field language-field">
+            <span>Text conversion</span>
+            <select
+              aria-label="Text conversion mode"
+              value={textMode}
+              onChange={(e) =>
+                setTextMode(e.target.value as "conservative" | "image-only")
+              }
+            >
+              <option value="conservative">Careful text conversion</option>
+              <option value="image-only">Images only · keep original</option>
+            </select>
+          </label>
+          <p className="conversion-hint">
+            {textMode === "image-only"
+              ? "Keep each image or PDF page intact. No text recognition. You can still move, resize, rotate, and crop it."
+              : "Only clear, confident text becomes editable. Boxed graphics, icons, and uncertain text stay as images."}
+            <span>Applies to the next import or paste.</span>
+          </p>
+          <label className="field language-field">
             <span>Text recognition</span>
             <select
               aria-label="Text recognition language"
               value={language}
+              disabled={textMode === "image-only"}
               onChange={(e) => setLanguage(e.target.value)}
             >
               <option value="eng">English</option>
@@ -1613,12 +1652,15 @@ export default function App() {
                 cropping.
               </p>
               <p>
-                <strong>About conversion.</strong> PDF text and recognized image
-                text become text boxes. Separate graphic regions become image
-                layers where possible. Photos and complex or touching artwork
-                may stay together. Text removal estimates nearby colors;
-                textured backgrounds and complex fonts may need touch-ups.
-                Review recognized text before exporting.
+                <strong>About conversion.</strong> Careful text conversion only
+                extracts confident text from plain areas. Text inside detected
+                graphic boxes, icons, and uncertain words keep their original
+                pixels. Detection is approximate; review the result. Choose
+                Images only before importing or pasting to keep each image or
+                PDF page intact with no text conversion at all. This also skips
+                selectable PDF text extraction. You can still move, resize,
+                rotate, and crop the image, or add text yourself. Changing the
+                mode applies to future imports, not pages already converted.
               </p>
               <p>
                 <strong>Take it with you.</strong> Save a Graphic project to
